@@ -2,96 +2,97 @@ name: Build All Modules
 
 on:
   push:
-    branches: [ master, main ]
+    branches: [ "master", "main" ]
   pull_request:
-    branches: [ master, main ]
-  workflow_dispatch:  # 手动触发
+    branches: [ "master", "main" ]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    
+
     steps:
-    - name: Checkout code
+    - name: Checkout repository
       uses: actions/checkout@v4
-      with:
-        submodules: recursive
-    
+
     - name: Set up JDK 11
-      uses: actions/setup-java@v3
+      uses: actions/setup-java@v4
       with:
         java-version: '11'
         distribution: 'temurin'
-        cache: maven
-    
-    - name: Install cross-compilation tools
+
+    - name: Install cross-compile toolchain
       run: |
         sudo apt-get update
-        sudo apt-get install -y gcc-mingw-w64-x86-64 gcc-mingw-w64-i686
-    
-    - name: Build native libraries
+        sudo apt-get install -y mingw-w64 nasm autoconf automake libtool
+
+    - name: Clone ISA-L source
+      run: git clone https://github.com/intel/isa-l.git
+
+    - name: Build Native Libraries (Linux .so & Windows .dll)
       run: |
-        chmod +x build.sh
-        # 修改 build.sh 中的 JNI 路径为 GitHub Actions 环境
-        sed -i 's|JNI_INCLUDE=.*|JNI_INCLUDE="/usr/lib/jvm/java-11-openjdk-amd64/include"|g' build.sh
-        ./build.sh
-    
-    - name: Build with Maven
-      run: mvn clean install -DskipTests
-    
-    - name: Prepare release artifacts
+        # 定义路径
+        ISA_L_DIR="$GITHUB_WORKSPACE/isa-l"
+        SRC_FILE="$GITHUB_WORKSPACE/igzip-java/src/main/c/igzip_jni.c"
+        JNI_INC="$JAVA_HOME/include"
+        
+        cd $ISA_L_DIR
+        ./autogen.sh
+        
+        # --- 1. 编译 Linux x64 版本 ---
+        CFLAGS="-O3 -fPIC -flto" ./configure
+        # 关键修改：只编译库 (lib)，跳过程序和文档，避免 make 错误
+        make -j$(nproc) lib
+        
+        # 修复头文件路径问题：代码引用 <isa-l/...>，但头文件在 include/ 下
+        # 创建软链接 include/isa-l -> include/
+        cd include
+        ln -s . isa-l
+        cd ..
+        
+        # 链接生成 .so
+        gcc -shared -s -O3 -fPIC -flto \
+          -I include/ -I $JNI_INC/ -I $JNI_INC/linux/ \
+          $SRC_FILE .libs/libisal.a \
+          -o $GITHUB_WORKSPACE/libigzip_jni.so
+        
+        # 清理构建产物，准备编译 Windows 版本
+        make distclean
+        
+        # --- 2. 编译 Windows x64 版本 ---
+        CFLAGS="-O3 -fPIC" ./configure --host=x86_64-w64-mingw32
+        # 关键修改：只编译库
+        make -j$(nproc) lib
+        
+        # 同样处理头文件软链接
+        cd include
+        ln -s . isa-l
+        cd ..
+        
+        # 链接生成 .dll (注意使用 win32 头文件)
+        x86_64-w64-mingw32-gcc -shared -s -O3 -fPIC \
+          -I include/ -I $JNI_INC/ -I $JNI_INC/win32/ \
+          $SRC_FILE .libs/libisal.a \
+          -o $GITHUB_WORKSPACE/igzip_jni.dll
+
+    - name: Prepare resources for Maven modules
       run: |
-        mkdir -p release-artifacts
+        mkdir -p igzip-linux-amd64/src/main/resources/native
+        mkdir -p igzip-windows-amd64/src/main/resources/native
         
-        # 复制所有 JAR 文件
-        find . -name '*.jar' -exec cp {} release-artifacts/ \;
-        
-        # 复制本地库文件
-        find . -name '*.so' -exec cp {} release-artifacts/ \;
-        find . -name '*.dll' -exec cp {} release-artifacts/ \;
-        
-        # 创建 POM 文件集合
-        find . -name 'pom.xml' -exec cp {} release-artifacts/ \;
-        
-        # 创建安装脚本
-        cat > release-artifacts/install-to-local-maven.bat << 'EOF'
-        @echo off
-        echo Installing igzip-java to local Maven repository...
-        
-        set GROUP_ID=com.github.caoli5288.igzip
-        set VERSION=0.2-SNAPSHOT
-        
-        echo Installing parent POM...
-        call mvn install:install-file -Dfile=pom.xml -DgroupId=%GROUP_ID% -DartifactId=igzip -Dversion=%VERSION% -Dpackaging=pom
-        
-        echo Installing igzip-java...
-        call mvn install:install-file -Dfile=igzip-java-0.2-SNAPSHOT.jar -DgroupId=%GROUP_ID% -DartifactId=igzip-java -Dversion=%VERSION% -Dpackaging=jar -DpomFile=igzip-java/pom.xml
-        
-        echo Installing igzip-linux-amd64...
-        call mvn install:install-file -Dfile=igzip-linux-amd64-0.2-SNAPSHOT.jar -DgroupId=%GROUP_ID% -DartifactId=igzip-linux-amd64 -Dversion=%VERSION% -Dpackaging=jar -DpomFile=igzip-linux-amd64/pom.xml
-        
-        echo Installing igzip-windows-amd64...
-        call mvn install:install-file -Dfile=igzip-windows-amd64-0.2-SNAPSHOT.jar -DgroupId=%GROUP_ID% -DartifactId=igzip-windows-amd64 -Dversion=%VERSION% -Dpackaging=jar -DpomFile=igzip-windows-amd64/pom.xml
-        
-        echo Installing igzip-all...
-        call mvn install:install-file -Dfile=igzip-all-0.2-SNAPSHOT.jar -DgroupId=%GROUP_ID% -DartifactId=igzip-all -Dversion=%VERSION% -Dpackaging=jar -DpomFile=igzip-all/pom.xml
-        
-        echo Installation completed successfully!
-        pause
-        EOF
-    
-    - name: Upload build artifacts
+        cp libigzip_jni.so igzip-linux-amd64/src/main/resources/native/
+        cp igzip_jni.dll igzip-windows-amd64/src/main/resources/native/
+
+    - name: Build and Install to Local Maven Repo
+      run: mvn install -DskipTests
+
+    - name: Package Maven Repository
+      run: |
+        cd ~/.m2/repository
+        tar -czf $GITHUB_WORKSPACE/maven-repo-all.tar.gz com/github/caoli5288
+
+    - name: Upload Maven Repo Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: igzip-build-artifacts
-        path: release-artifacts/
-    
-    - name: Create Release
-      if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: v0.2-SNAPSHOT-${{ github.sha }}
-        name: Build ${{ github.sha }}
-        files: release-artifacts/*
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        name: maven-repo-all
+        path: maven-repo-all.tar.gz
