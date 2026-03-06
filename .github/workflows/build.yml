@@ -5,7 +5,6 @@ on:
     branches: [ "master", "main" ]
   pull_request:
     branches: [ "master", "main" ]
-  # 允许手动触发
   workflow_dispatch:
 
 jobs:
@@ -32,29 +31,43 @@ jobs:
 
     - name: Build Native Libraries (Linux .so & Windows .dll)
       run: |
-        chmod +x build.sh
-        # 修正 build.sh 中的 JNI 路径指向 Actions 环境的 JDK
-        sed -i 's|/usr/lib/jvm/java-11-openjdk-amd64/include|/usr/lib/jvm/temurin-11-jdk-amd64/include|g' build.sh
-        # 执行编译，生成 libigzip_jni.so 和 igzip_jni.dll 到根目录
-        ./build.sh
+        # 定义路径变量
+        ISA_L_DIR="$GITHUB_WORKSPACE/isa-l"
+        SRC_FILE="$GITHUB_WORKSPACE/igzip-java/src/main/c/igzip_jni.c"
+        JNI_INC="$JAVA_HOME/include"
+        
+        # --- 1. 编译 Linux x64 版本 ---
+        cd $ISA_L_DIR
+        ./autogen.sh
+        CFLAGS="-O3 -fPIC -flto" ./configure
+        make -j$(nproc)
+        
+        # 链接生成 .so (注意使用绝对路径指定源文件)
+        gcc -shared -s -O3 -fPIC -flto \
+          -I include/ -I $JNI_INC/ -I $JNI_INC/linux/ \
+          $SRC_FILE .libs/libisal.a \
+          -o $GITHUB_WORKSPACE/libigzip_jni.so
+        
+        # 清理 ISA-L 构建产物，准备编译 Windows 版本
+        make clean
+
+        # --- 2. 编译 Windows x64 版本 ---
+        CFLAGS="-O3 -fPIC" ./configure --host=x86_64-w64-mingw32
+        make -j$(nproc)
+        
+        # 链接生成 .dll (注意：Windows JNI 头文件在 win32/ 目录下)
+        x86_64-w64-mingw32-gcc -shared -s -O3 -fPIC \
+          -I include/ -I $JNI_INC/ -I $JNI_INC/win32/ \
+          $SRC_FILE .libs/libisal.a \
+          -o $GITHUB_WORKSPACE/igzip_jni.dll
 
     - name: Prepare resources for Maven modules
       run: |
-        # 将编译好的库文件放入各自模块的资源目录
         mkdir -p igzip-linux-amd64/src/main/resources/native
         mkdir -p igzip-windows-amd64/src/main/resources/native
         
-        if [ -f "libigzip_jni.so" ]; then
-          cp libigzip_jni.so igzip-linux-amd64/src/main/resources/native/
-        else
-          echo "Error: libigzip_jni.so not found" && exit 1
-        fi
-        
-        if [ -f "igzip_jni.dll" ]; then
-          cp igzip_jni.dll igzip-windows-amd64/src/main/resources/native/
-        else
-          echo "Error: igzip_jni.dll not found" && exit 1
-        fi
+        cp libigzip_jni.so igzip-linux-amd64/src/main/resources/native/
+        cp igzip_jni.dll igzip-windows-amd64/src/main/resources/native/
 
     - name: Build and Install to Local Maven Repo
       run: mvn install -DskipTests
