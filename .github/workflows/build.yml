@@ -1,140 +1,133 @@
 name: Build All Modules
 
-# .github/workflows/build-and-release.yml
-# 将此文件放入你 fork 的仓库的 .github/workflows/ 目录下
-
 on:
   workflow_dispatch:   # 手动触发
   push:
     branches: [ master ]
 
 jobs:
-  # ────────────────────────────────────────────
-  # 1. 在 Linux 上编译本地库 + 所有 Maven 模块
-  # ────────────────────────────────────────────
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
 
     steps:
+      # ── 1. 拉取代码 ──────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      # ── JDK ──
-      - name: Set up JDK 11
-        uses: actions/setup-java@v4
-        with:
-          java-version: '11'
-          distribution: 'temurin'
-
-      # ── 系统依赖（nasm 是 igzip 汇编加速所必须的）──
+      # ── 2. 安装系统工具 ───────────────────────────────────────────
       - name: Install build dependencies
         run: |
           sudo apt-get update -y
           sudo apt-get install -y \
-            cmake \
-            nasm \
-            gcc \
-            g++ \
-            make
+            build-essential cmake nasm autoconf automake libtool \
+            mingw-w64
 
-      # ── 编译 C/JNI 本地库（生成 .so） ──
-      - name: Build native library (CMake)
+      # ── 3. 从源码编译安装 Intel ISA-L (libisal) ───────────────────
+      #      GitHub Actions 的 ubuntu-latest 没有预装 libisal，
+      #      apt 源里也没有此版本，必须从源码自行编译
+      - name: Build & install Intel ISA-L from source
         run: |
-          mkdir -p build
-          cd build
+          git clone --depth=1 https://github.com/intel/isa-l.git /tmp/isa-l
+          cd /tmp/isa-l
+          ./autogen.sh
+          ./configure --prefix=/usr
+          make -j$(nproc)
+          sudo make install
+          sudo ldconfig
+          # 验证 pkg-config 能找到 libisal
+          pkg-config --modversion libisal
+
+      # ── 4. 配置 JDK ──────────────────────────────────────────────
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '11'
+
+      # ── 5. 编译 Linux 原生库（igzip_jni.so）─────────────────────
+      - name: Build Linux native library
+        run: |
+          mkdir -p build-linux && cd build-linux
           cmake .. -DCMAKE_BUILD_TYPE=Release
           make -j$(nproc)
-          echo "=== Native libs ==="
-          find . -name "*.so" -o -name "*.dll" | head -30
+          echo "=== Built .so files ==="
+          find . -name "*.so" -o -name "*.so.*"
+          # 复制到 Maven 资源目录
+          mkdir -p ../igzip-linux-amd64/src/main/resources/native/
+          find . -name "*.so" -exec cp {} \
+            ../igzip-linux-amd64/src/main/resources/native/ \;
 
-      # ── 把编译好的 .so 拷贝到 Maven 资源目录 ──
-      # （根据仓库惯例，linux amd64 的 so 放在 igzip-linux-amd64/src/main/resources/）
-      - name: Copy native .so into Maven resource dir
+      # ── 6. 交叉编译 Windows 原生库（igzip_jni.dll）──────────────
+      #      先为 mingw 单独编译一份 isa-l 静态库，再用它链接 DLL
+      - name: Build isa-l Windows static library (cross-compile)
         run: |
-          SO=$(find build -name "libigzip*.so" | head -1)
-          if [ -z "$SO" ]; then
-            echo "WARNING: no .so found, trying fallback name"
-            SO=$(find build -name "*.so" | head -1)
-          fi
-          echo "Using native lib: $SO"
-          RESOURCE_DIR="igzip-linux-amd64/src/main/resources/native/linux/amd64"
-          mkdir -p "$RESOURCE_DIR"
-          cp "$SO" "$RESOURCE_DIR/"
+          cd /tmp/isa-l
+          make -f Makefile.unx \
+            CC=x86_64-w64-mingw32-gcc \
+            AR=x86_64-w64-mingw32-ar \
+            CFLAGS_="-DWIN_ABI" \
+            libe || true
 
-      # ── Maven 编译 + install 所有模块到本地缓存 ──
-      - name: Maven build all modules
+      - name: Build Windows native library (cross-compile)
         run: |
-          mvn clean install -DskipTests -B \
+          mkdir -p build-win && cd build-win
+          cmake .. \
+            -DCMAKE_SYSTEM_NAME=Windows \
+            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DISAL_INCLUDE_DIRS=/tmp/isa-l/include \
+            -DISAL_LIBRARIES=/tmp/isa-l/libisal.a \
+            || echo "Windows cross-compile cmake failed, skipping"
+          make -j$(nproc) || echo "Windows cross-compile make failed, skipping"
+          echo "=== Built .dll files ==="
+          find . -name "*.dll" 2>/dev/null || echo "No DLL found (non-fatal)"
+          mkdir -p ../igzip-windows-amd64/src/main/resources/native/
+          find . -name "*.dll" -exec cp {} \
+            ../igzip-windows-amd64/src/main/resources/native/ \; 2>/dev/null || true
+
+      # ── 7. Maven 构建并安装所有模块到本地仓库 ────────────────────
+      - name: Maven build & install all modules
+        run: |
+          mvn clean install -B \
+            -DskipTests \
             --no-transfer-progress
 
-      # ── 收集所有产物 JAR ──
-      - name: Collect JARs
+      # ── 8. 收集产物到 dist/ 目录 ──────────────────────────────────
+      - name: Collect Maven artifacts
         run: |
           mkdir -p dist
-          # 复制所有子模块的 target/*.jar（排除 sources/javadoc）
-          find . -path "*/target/*.jar" \
-            ! -name "*-sources.jar" \
-            ! -name "*-javadoc.jar" \
-            -exec cp {} dist/ \;
-          echo "=== Collected JARs ==="
+          for module in igzip-java igzip-linux-amd64 igzip-windows-amd64 igzip-all; do
+            if [ -d "$module/target" ]; then
+              cp $module/target/*.jar dist/ 2>/dev/null || true
+              cp $module/pom.xml dist/${module}.pom 2>/dev/null || true
+            fi
+          done
+          cp pom.xml dist/igzip-parent.pom
+          echo "=== dist contents ==="
           ls -lh dist/
 
-      # ── 同时打包整个 ~/.m2/repository/com/github/caoli5288 供离线使用 ──
-      - name: Package local Maven repository
-        run: |
-          REPO_DIR="$HOME/.m2/repository/com/github/caoli5288"
-          if [ -d "$REPO_DIR" ]; then
-            tar -czf dist/igzip-maven-repo.tar.gz -C "$HOME/.m2/repository" com/github/caoli5288
-            echo "Packaged maven repo:"
-            ls -lh dist/igzip-maven-repo.tar.gz
-          else
-            echo "Maven repo dir not found at $REPO_DIR"
-            find ~/.m2 -path "*caoli5288*" | head -20
-          fi
-
-      # ── 上传为 Actions Artifact（无需 Release，直接下载）──
-      - name: Upload JARs as workflow artifact
+      # ── 9. 上传散装 JAR + POM（方便逐个手动安装）────────────────
+      - name: Upload JAR artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: igzip-jars
+          name: igzip-maven-jars
           path: dist/
           retention-days: 30
 
-  # ────────────────────────────────────────────
-  # 2. 创建 GitHub Release 并附上所有文件
-  # ────────────────────────────────────────────
-  release:
-    needs: build
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: write   # 允许创建 Release
+      # ── 10. 打包完整 m2 仓库目录（解压即用，最推荐方式）────────
+      - name: Package local m2 repository
+        run: |
+          tar -czf igzip-m2-repo.tar.gz \
+            -C ~/.m2/repository \
+            com/github/caoli5288/
+          echo "=== tar contents ==="
+          tar -tzf igzip-m2-repo.tar.gz
 
-    steps:
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
+      - name: Upload full m2 repo snapshot
+        uses: actions/upload-artifact@v4
         with:
-          name: igzip-jars
-          path: dist/
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: snapshot-${{ github.run_number }}
-          name: "igzip SNAPSHOT Build #${{ github.run_number }}"
-          body: |
-            自动构建的 igzip Maven 依赖包。
-
-            ### 包含文件
-            - `igzip-all-*.jar` — 全平台 fat jar（推荐使用）
-            - `igzip-java-*.jar` — 纯 Java 接口层
-            - `igzip-linux-amd64-*.jar` — Linux x64 本地库
-            - `igzip-windows-amd64-*.jar` — Windows x64 本地库
-            - `igzip-maven-repo.tar.gz` — 本地 Maven 仓库压缩包（解压后可直接使用）
-
-            ### 安装到 Windows 本地库
-            见 README 说明。
-          files: dist/*
-          draft: false
-          prerelease: true
+          name: igzip-m2-repo
+          path: igzip-m2-repo.tar.gz
+          retention-days: 30
