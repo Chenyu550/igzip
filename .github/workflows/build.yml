@@ -1,0 +1,71 @@
+name: Build All Modules
+
+on:
+  push:
+    branches: [ "master", "main" ]
+  pull_request:
+    branches: [ "master", "main" ]
+  # 允许手动触发
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up JDK 11
+      uses: actions/setup-java@v4
+      with:
+        java-version: '11'
+        distribution: 'temurin'
+
+    - name: Install cross-compile toolchain
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y mingw-w64 nasm autoconf automake libtool
+
+    - name: Clone ISA-L source
+      run: git clone https://github.com/intel/isa-l.git
+
+    - name: Build Native Libraries (Linux .so & Windows .dll)
+      run: |
+        chmod +x build.sh
+        # 修正 build.sh 中的 JNI 路径指向 Actions 环境的 JDK
+        sed -i 's|/usr/lib/jvm/java-11-openjdk-amd64/include|/usr/lib/jvm/temurin-11-jdk-amd64/include|g' build.sh
+        # 执行编译，生成 libigzip_jni.so 和 igzip_jni.dll 到根目录
+        ./build.sh
+
+    - name: Prepare resources for Maven modules
+      run: |
+        # 将编译好的库文件放入各自模块的资源目录
+        mkdir -p igzip-linux-amd64/src/main/resources/native
+        mkdir -p igzip-windows-amd64/src/main/resources/native
+        
+        if [ -f "libigzip_jni.so" ]; then
+          cp libigzip_jni.so igzip-linux-amd64/src/main/resources/native/
+        else
+          echo "Error: libigzip_jni.so not found" && exit 1
+        fi
+        
+        if [ -f "igzip_jni.dll" ]; then
+          cp igzip_jni.dll igzip-windows-amd64/src/main/resources/native/
+        else
+          echo "Error: igzip_jni.dll not found" && exit 1
+        fi
+
+    - name: Build and Install to Local Maven Repo
+      run: mvn install -DskipTests
+
+    - name: Package Maven Repository
+      run: |
+        cd ~/.m2/repository
+        tar -czf $GITHUB_WORKSPACE/maven-repo-all.tar.gz com/github/caoli5288
+
+    - name: Upload Maven Repo Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: maven-repo-all
+        path: maven-repo-all.tar.gz
