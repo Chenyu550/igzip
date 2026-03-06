@@ -105,7 +105,3 @@ jobs:
           name: igzip-m2-repo
           path: igzip-m2-repo.tar.gz
           retention-days: 30
-      uses: actions/upload-artifact@v4
-      with:
-        name: maven-repo-all
-        path: maven-repo-all.tar.gz
