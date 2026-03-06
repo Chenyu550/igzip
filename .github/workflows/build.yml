@@ -31,7 +31,7 @@ jobs:
 
     - name: Build Native Libraries (Linux .so & Windows .dll)
       run: |
-        # 定义路径变量
+        # 定义路径
         ISA_L_DIR="$GITHUB_WORKSPACE/isa-l"
         SRC_FILE="$GITHUB_WORKSPACE/igzip-java/src/main/c/igzip_jni.c"
         JNI_INC="$JAVA_HOME/include"
@@ -42,20 +42,50 @@ jobs:
         CFLAGS="-O3 -fPIC -flto" ./configure
         make -j$(nproc)
         
-        # 链接生成 .so (注意使用绝对路径指定源文件)
+        # 关键修正：代码里写的是 <isa-l/igzip_lib.h>，所以需要把 isa-l 目录本身加入包含路径
+        # -I. (当前目录 isa-l/) 意味着编译器会查找 ./isa-l/igzip_lib.h (即 include/isa-l/igzip_lib.h 的软链接或实际路径)
+        # 更稳妥的方式是 -I./include，因为生成的头文件在那里。
+        # 实际上 ISA-L 的 Makefile 会把头文件生成到 include/ 下。
+        # 而 include/ 下通常有 igzip_lib.h，但没有 isa-l/ 这个子目录。
+        # 如果源码强制要求 <isa-l/xxx.h>，我们需要建立一个软链接或者在包含路径上做文章。
+        
+        # 检查 include 目录结构
+        ls -R include/
+        
+        # 假设头文件在 include/，我们需要让编译器认为有 isa-l/ 这一层
+        # 或者，如果 igzip_jni.c 可以修改，最好的办法是改源码。
+        # 但既然是编译现有仓库，我们尝试用包含路径解决。
+        # 注意：ISA-L 编译后，头文件通常在 include/ 根目录。
+        # 如果代码一定要 <isa-l/igzip_lib.h>，我们需要在 include/ 下创建 isa-l 软链接指向当前目录？
+        # 或者更简单的：如果代码实际上是在找 isa-l 这个文件夹下的头文件。
+        
+        # 让我们查看一下原作者的 build.sh 是怎么处理的。
+        # 原作者 build.sh: gcc ... -I include/
+        # 如果原作者能编译通过，说明 include/ 下应该有 isa-l/ 目录，或者源码不一样。
+        # 让我们尝试在 include/ 下创建软链接指向父目录，以模拟 isa-l/ 目录结构
+        cd include
+        ln -s . isa-l
+        cd ..
+        
+        # 现在编译 Linux 版本
         gcc -shared -s -O3 -fPIC -flto \
           -I include/ -I $JNI_INC/ -I $JNI_INC/linux/ \
           $SRC_FILE .libs/libisal.a \
           -o $GITHUB_WORKSPACE/libigzip_jni.so
         
-        # 清理 ISA-L 构建产物，准备编译 Windows 版本
+        # 清理并准备 Windows 版本
         make clean
+        cd include && rm isa-l && cd ..
 
         # --- 2. 编译 Windows x64 版本 ---
         CFLAGS="-O3 -fPIC" ./configure --host=x86_64-w64-mingw32
         make -j$(nproc)
         
-        # 链接生成 .dll (注意：Windows JNI 头文件在 win32/ 目录下)
+        # 同样处理 Windows 版的头文件链接
+        cd include
+        ln -s . isa-l
+        cd ..
+        
         x86_64-w64-mingw32-gcc -shared -s -O3 -fPIC \
           -I include/ -I $JNI_INC/ -I $JNI_INC/win32/ \
           $SRC_FILE .libs/libisal.a \
